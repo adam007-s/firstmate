@@ -20,6 +20,10 @@
 # nothing an owner would see. Recording those findings instead of fixing them
 # keeps them from being silently dropped, and the record lives in the firstmate
 # home rather than the worktree so it survives the worktree being discarded.
+# The cap governs severity, never authority: it decides what is worth fixing and
+# never who answers. An ask-user finding still routes to firstmate at every
+# severity, so the block states that boundary out loud rather than leaving a
+# worker who reads only the brief to rank the two rules against each other.
 # The block opens with the fixed machine-readable "Delivery contract: mode=<mode>"
 # line that bin/fm-spawn.sh checks a ship brief against.
 # Every heredoc here stays outside a command substitution: `VAR=$(cat <<EOF ...)`
@@ -76,8 +80,9 @@ Two firstmate-specific rules layer on top of that guidance:
   It auto-resolves every gate including ask-user findings with no escalation, and answering your own ask-user finding is a hard rule violation.
 
 Cap the review loop. Fix genuine defects the review finds, and do not let cosmetic ones park the run:
-- At \`info\` severity, approve the finding unfixed and record it verbatim in \`$findings\` instead. Do not fix it, and do not stop to ask about it. Writing that one record is an authorized exception to the rule keeping you inside the worktree; it lives outside the worktree so it survives after the worktree is discarded.
-- Stop with \`needs-decision\` only for a genuine correctness or security defect: one that loses data, corrupts a record, or exposes it. Wording, naming, structure, duplication, and documentation never qualify, whatever severity they carry.
+- The cap decides what is worth fixing; it never decides who answers. A finding the pipeline classifies as \`ask-user\` is never yours to approve, fix, or skip, at any severity - route it to firstmate exactly as the rule above requires and apply only the decision that comes back. Every bullet below applies only to findings that are already yours to decide.
+- At \`info\` severity, approve the finding unfixed and record it verbatim in \`$findings\` instead. Do not fix it, do not polish it, and do not stop to ask about it. Writing that one record is an authorized exception to the rule keeping you inside the worktree; it lives outside the worktree so it survives after the worktree is discarded.
+- Stop with \`needs-decision\` only for a genuine correctness or security defect. Producing a wrong result, losing data, corrupting a record, and exposing it are examples of that, not the whole of it. Wording, naming, structure, duplication, and documentation never qualify, whatever severity they carry.
 - Take on no new refactors, no scope broadening, and no tidiness work.
 
 After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
