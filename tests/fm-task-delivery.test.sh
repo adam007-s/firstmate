@@ -357,6 +357,13 @@ STUB
     "promoted no-mistakes worker did not receive the --yes prohibition"
   assert_grep "It is banned fleet-wide" "$payload" \
     "promoted no-mistakes worker did not receive the fleet-wide ban wording"
+  # A promoted scout ships through the same review loop, so it needs the same cap
+  # a briefed no-mistakes worker gets; the suffix comparison above proves the two
+  # renderings agree, and this pins that the cap is what they agree on.
+  assert_grep "Cap the review loop." "$payload" \
+    "promoted no-mistakes worker did not receive the review-loop cap"
+  assert_grep "/promote-dod-no-mistakes/remaining-findings.md" "$payload" \
+    "promoted no-mistakes worker was not given its own findings record path"
 
   payload="$TMP_ROOT/promote-dod/payload-promote-dod-direct-pr"
   assert_grep "supersede the scout delivery rules and report-based Definition of done" "$payload" \
