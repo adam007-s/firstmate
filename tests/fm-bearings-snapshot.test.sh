@@ -762,7 +762,11 @@ EOF
     "harness=claude" "kind=ship" "mode=no-mistakes"
   record_claude_state "$mate/state" "done" idle
   record_claude_state "$mate/state" failed idle
-  printf 'done: complete\n' > "$mate/state/done.status"
+  # A genuinely terminal done for a mode=no-mistakes child names its PR: that is
+  # what its definition of done is (bin/fm-dod-lib.sh), and a done with no PR is
+  # not terminal at all (bin/fm-crew-state.sh's done-without-a-PR rule), so it
+  # would exercise the hold path below instead of this terminal one.
+  printf 'done: PR https://github.com/o/r/pull/7 checks green\n' > "$mate/state/done.status"
   printf 'failed: stopped\n' > "$mate/state/failed.status"
   rm "$mate/state/parked.meta" "$mate/state/parked.status"
   canonical=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-07-11T18:00:00Z \
@@ -777,6 +781,21 @@ EOF
       and .provenance.trust == "partial-structured"
       and .invalidity == {kind:"terminal_in_flight",ids:["done","failed"]}
   ' >/dev/null || fail "terminal in-flight rows discarded the readable home: $canonical"
+  # The consumer half of the done-without-a-PR rule. The SAME child, with the PR
+  # dropped from its done line, is no longer terminal: its in-flight backlog row
+  # is then correct rather than a contradiction, so this home keeps its
+  # projection instead of being marked terminal_in_flight, and the child still
+  # surfaces - as a hold naming the contradiction, which is what a supervisor
+  # must act on.
+  printf 'done: complete\n' > "$mate/state/done.status"
+  canonical=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-07-11T18:00:00Z \
+    "$ROOT/bin/fm-fleet-snapshot.sh" --json)
+  printf '%s' "$canonical" | jq -e '
+    .secondmate_current.records[] | select(.id == "states")
+    | (.invalidity.ids | index("done") | not)
+      and (.holds | any(.id == "done" and .source == "child-state"
+                        and (.reason | contains("NOT FINISHED"))))
+  ' >/dev/null || fail "a done with no PR was not surfaced as a hold: $canonical"
   pass "nonprogressing child states are explicit and inconsistent terminal rows invalidate"
 }
 

@@ -126,6 +126,37 @@ status_is_terminal_verb() {
   esac
 }
 
+# 0 if a status line reports `done:` under a delivery mode whose definition of
+# done is a raised PR while carrying no full https:// URL. That pair is
+# self-contradicting, and `done` is the one verb firstmate is entitled to read as
+# terminal: the captain report, teardown, and dependent dispatch all key off it,
+# so a done with nothing to review or merge is terminal and wrong at once.
+# bin/fm-dod-lib.sh owns each mode's definition of done; no-mistakes and
+# direct-PR are the two that end in a PR.
+# Keyed off the RECORDED mode only, never inferred. local-only legitimately ends
+# with `done: ready in branch fm/<id>`, `mode=secondmate` is not a delivery
+# contract, and an ABSENT mode (a scout, whose deliverable is its report, or a
+# task recorded before modes were stored) proves no PR requirement at all, so all
+# three stay silent - a false alarm on every correct no-PR completion would be
+# worse than the miss this catches.
+# Deliberately forge-agnostic: it asks only whether the line carries a full
+# https:// link, so a PR on any forge passes and this test never becomes a second
+# copy of bin/fm-pr-lib.sh's canonical PR/MR URL grammar.
+# A pure line read: the caller supplies the mode, so this stays as free of
+# metadata and side effects as every other predicate here. Consumers layer their
+# own reconciliation on top; bin/fm-crew-state.sh owns what the contradiction
+# becomes as a current state.
+status_done_missing_required_pr() {  # <status-line> <delivery-mode>
+  local line=$1 mode=${2-}
+  case "$mode" in
+    no-mistakes|direct-PR) ;;
+    *) return 1 ;;
+  esac
+  [ "$(status_line_verb "$line")" = "done" ] || return 1
+  case "$line" in *https://?*) return 1 ;; esac
+  return 0
+}
+
 # 0 if the given (last) status line matches a captain-relevant verb.
 # Verb-aware by default: terminal verbs always match; nonterminal progress verbs
 # (working, resolved, captain-held) and paused never match from free-text prose;
