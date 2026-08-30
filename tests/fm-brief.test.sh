@@ -410,13 +410,13 @@ test_no_mistakes_brief_caps_the_review_loop() {
     "review cap must leave ask-user routing intact at every severity"
   assert_grep "Every bullet below applies only to findings that are already yours to decide." "$brief" \
     "review cap must scope its remaining bullets to worker-decidable findings"
-  assert_grep "At \`info\` severity, approve the finding unfixed and record it verbatim in \`$record\` instead." "$brief" \
+  assert_grep "Unless it is the genuine correctness or security defect the next bullet names, at \`info\` severity approve the finding unfixed and record it verbatim in \`$record\` instead." "$brief" \
     "review cap must name the info-severity threshold and the absolute record path"
   assert_grep "Do not fix it, do not polish it, and do not stop to ask about it." "$brief" \
     "review cap must forbid both fixing and parking on an info finding"
   assert_grep "authorized exception to the rule keeping you inside the worktree" "$brief" \
     "review cap must authorize the one write it asks for outside the worktree"
-  assert_grep "Stop with \`needs-decision\` only for a genuine correctness or security defect." "$brief" \
+  assert_grep "Regardless of severity, including \`info\`, stop with \`needs-decision\` only for a genuine correctness or security defect." "$brief" \
     "review cap lost the escape hatch for a real defect"
   assert_grep "Producing a wrong result, losing data, corrupting a record, and exposing it are examples of that, not the whole of it." "$brief" \
     "review cap must keep its defect list as examples rather than a definition"
