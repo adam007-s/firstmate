@@ -43,6 +43,15 @@
 #      recorded backend's pane busy state, then the status log's last line only
 #      when its verb maps to a recognized run-state. Decision-only events such as
 #      `resolved` never become current state or detail.
+#   4b. A `done:` log line under a recorded mode= whose definition of done is a
+#      raised PR (no-mistakes, direct-PR) but carrying no https:// URL never
+#      reports `done`. It is the log contradicting the task's own delivery
+#      contract, so it reports `blocked` naming the contradiction; where a run is
+#      attributed, the run-step keeps precedence and answers instead. local-only,
+#      secondmates, and an absent mode are untouched - they legitimately finish
+#      with no PR. status_done_missing_required_pr (bin/fm-classify-lib.sh) owns
+#      the line-level test. Surfacing only: nothing is steered, reopened, or torn
+#      down differently.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log.
@@ -102,6 +111,11 @@ WT=$(meta_value worktree)
 KIND=$(meta_value kind)
 HARNESS=$(meta_value harness)
 REMOTE_HOST=$(meta_value remote_host)
+# The task's recorded delivery contract. Absent for a scout and for tasks
+# recorded before modes were stored; `secondmate` for a persistent mate. Read
+# only by the done-without-a-PR reconciliation below, which treats every value
+# but no-mistakes and direct-PR as proving no PR requirement.
+MODE=$(meta_value mode)
 [ -n "$KIND" ] || KIND=ship
 
 # A torn-down (or never-created) worktree has no current state to read. A
@@ -141,6 +155,30 @@ map_log_state() {  # <line>
 LOG_LINE=$(log_last_line || true)
 LOG_VERB=$(status_line_verb "$LOG_LINE")
 
+# A `done:` reported under a delivery mode that ships through a PR, while the
+# line names no PR, is a status log contradicting the task's own recorded
+# delivery contract. status_done_missing_required_pr (bin/fm-classify-lib.sh)
+# owns that line-level test and stays silent for local-only, secondmates, and an
+# absent mode; this reader owns what the contradiction becomes. It is evaluated
+# once here because every status-log-sourced `done` below shares it.
+DONE_MISSING_PR=0
+status_done_missing_required_pr "$LOG_LINE" "$MODE" && DONE_MISSING_PR=1
+
+# Report the contradiction instead of a clean `done`. `blocked` is the existing
+# state for "not finished, and firstmate must act" (`paused` is the bounded
+# external wait), so every consumer of this line already handles it: the fleet
+# snapshot lists the task as a hold carrying this detail, the watcher's absorb
+# classification treats it exactly as it treated `done` (surface the wake), and
+# the inactive-outcome scan stops minting a terminal-outcome record for work
+# that has not terminated. Deliberately does NOT steer the worker, reopen the
+# task, or change teardown, which keeps its own landed-work test: how far the
+# worker actually got is firstmate's call, and this only makes the
+# contradiction impossible to read as success.
+emit_done_missing_pr() {
+  emit blocked status-log \
+    "NOT FINISHED: done reported with no PR URL, and mode=$MODE ships through a PR${SEP}$(status_line_note "$LOG_LINE")"
+}
+
 # --- remote secondmate: the true source is the remote endpoint ---------------
 # A remote mate's recorded worktree and backend target live on its own host, so
 # the local worktree probe above and the local pane reads below would misreport
@@ -161,6 +199,7 @@ if [ -n "$REMOTE_HOST" ]; then
   case "$REMOTE_STATE" in
     alive)
       if [ -n "$LOG_VERB" ]; then
+        [ "$DONE_MISSING_PR" = 1 ] && emit_done_missing_pr
         LOG_STATE=$(map_log_state "$LOG_LINE")
         if [ "$LOG_STATE" != unknown ]; then
           emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")${SEP}remote endpoint alive on $REMOTE_HOST"
@@ -285,6 +324,11 @@ nm_gate_findings_count() {
 }
 log_reports_ci_ready() {
   [ "$LOG_VERB" = "done" ] || return 1
+  # A CI-ready claim with no PR URL names nothing to check. Returning 1 hands the
+  # answer back to the attributed run, which is this reader's standing precedence
+  # rule (the run-step outranks the log), so such a crew reports the run's own
+  # truthful working/parked/terminal state rather than a finished task.
+  [ "$DONE_MISSING_PR" = 1 ] && return 1
   case "$(status_line_note "$LOG_LINE")" in
     *PR*"checks green"*|*"checks green"*PR*) return 0 ;;
     *) return 1 ;;
@@ -616,6 +660,7 @@ fi
 # the verb->state mapping (including the configurable paused verb), so reusing its
 # `unknown` verdict as the "not a state" test needs no second verb list here.
 if [ -n "$LOG_VERB" ]; then
+  [ "$DONE_MISSING_PR" = 1 ] && emit_done_missing_pr
   LOG_STATE=$(map_log_state "$LOG_LINE")
   if [ "$LOG_STATE" != unknown ]; then
     emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"

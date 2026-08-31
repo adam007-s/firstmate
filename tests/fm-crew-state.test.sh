@@ -19,6 +19,9 @@
 #   (h) dead pane: no run -> unknown/none; with a run -> run-step (not the shell)
 #   (i) kind=scout skips the run lookup                           -> pane/status-log
 #   (j) torn-down worktree / missing meta                         -> unknown/none
+#   (l) a `done:` naming no PR under a mode whose done IS a PR (no-mistakes,
+#       direct-PR) never reads as finished, while local-only, a secondmate, an
+#       absent mode, and any done carrying a URL are unchanged
 #   (k) crew_is_provably_working end-to-end over the REAL helper (not a canned
 #       fake fm-crew-state.sh verdict): cross-branch attribution via the runs
 #       list -> absorbed; genuinely no run anywhere + idle pane -> surfaced.
@@ -1030,6 +1033,158 @@ test_no_run_idle_secondmate_resolved_event_not_state() {
   pass "a trailing resolved: event does not corrupt state render (idle stays idle)"
 }
 
+# --- done: without the PR its delivery mode requires -----------------------
+#
+# `done` is the one status verb firstmate reads as terminal - the captain
+# report, teardown, and dependent dispatch all key off it. A no-mistakes or
+# direct-PR task whose done names no PR has nothing to review or merge, so it is
+# terminal and wrong at once (the near-miss: a whole feature built, verified in a
+# real browser, and reported done on a branch that was one unpushed commit with
+# no pipeline run and no PR, while this reader said `state: done`).
+# These cases pin BOTH directions through the executable: the contradiction is
+# surfaced under the two PR modes, and every legitimately PR-less completion -
+# local-only, a secondmate, an absent mode, and any done that does carry a URL -
+# still reads exactly as before.
+
+# Run the helper over an idle, run-less crew whose status log holds <line>.
+# Echoes the one state line. <meta-extra...> carries the mode= under test (or
+# nothing, for the absent-mode case).
+run_idle_log_case() {  # <case-name> <task> <status-line> <meta-extra...>
+  local name=$1 task=$2 line=$3 d
+  shift 3
+  reset_fakes
+  d=$(new_case "$name")
+  make_repo_on_branch "$d/wt" "fm/$task"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/$task.meta" "window=fm:fm-$task" "worktree=$d/wt" \
+    "kind=ship" "harness=claude" "$@"
+  printf '%s\n' "$line" > "$d/state/$task.status"
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" "$task"
+  run_crew_state "$d" "$task"
+}
+
+test_done_without_pr_on_pr_modes_is_not_finished() {
+  local out
+  out=$(run_idle_log_case dwp-nm dwpnm \
+    'done: move/rename/remove strip + 3 carry-over fixes; 68 API checks green' \
+    "mode=no-mistakes")
+  assert_not_contains "$out" "state: done" "a no-mistakes done with no PR must not read as finished"
+  assert_contains "$out" "state: blocked" "the contradiction reports blocked (firstmate must act)"
+  assert_contains "$out" "source: status-log" "the contradiction is still a status-log read"
+  assert_contains "$out" "NOT FINISHED" "the contradiction is obvious at a glance"
+  assert_contains "$out" "no PR URL" "the detail names what is missing"
+  assert_contains "$out" "mode=no-mistakes" "the detail names the delivery contract it contradicts"
+  assert_contains "$out" "68 API checks green" "the worker's own report is preserved in the detail"
+
+  out=$(run_idle_log_case dwp-dpr dwpdpr 'done: pushed the branch' "mode=direct-PR")
+  assert_not_contains "$out" "state: done" "a direct-PR done with no PR must not read as finished"
+  assert_contains "$out" "state: blocked" "direct-PR gets the same verdict"
+  assert_contains "$out" "mode=direct-PR" "the detail names the direct-PR contract"
+  pass "done: with no PR URL on a PR-shipping mode does not read as finished"
+}
+
+# THE regression this rule must never cause: local-only's own definition of done
+# is `done: ready in branch fm/<id>` (bin/fm-dod-lib.sh), with no remote, no PR
+# and no pipeline. Turning every correct local-only completion into a false alarm
+# would be worse than the miss the rule catches.
+test_done_without_pr_on_local_only_is_unchanged() {
+  local out
+  out=$(run_idle_log_case dwp-lo dwplo 'done: ready in branch fm/dwplo' "mode=local-only")
+  assert_contains "$out" "state: done" "local-only done with no PR still reads done"
+  assert_contains "$out" "source: status-log" "local-only keeps its status-log source"
+  assert_contains "$out" "ready in branch fm/dwplo" "local-only keeps its own note as the detail"
+  assert_not_contains "$out" "NOT FINISHED" "local-only must never be flagged"
+  assert_not_contains "$out" "state: blocked" "local-only must never be flagged"
+  pass "local-only done with no PR is unchanged"
+}
+
+# An absent mode= (a scout, whose deliverable is its report, or a task recorded
+# before modes were stored) proves no PR requirement, and mode=secondmate is not
+# a delivery contract at all. Both stay silent: the rule keys off the RECORDED
+# mode and never infers one.
+test_done_without_pr_stays_silent_without_a_pr_mode() {
+  local out d
+  out=$(run_idle_log_case dwp-none dwpnone 'done: report written to data/dwpnone/report.md')
+  assert_contains "$out" "state: done" "an absent mode is not a PR requirement"
+  assert_not_contains "$out" "NOT FINISHED" "an absent mode must not be flagged"
+
+  reset_fakes
+  d=$(new_case dwp-mate)
+  mkdir -p "$d/wt"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/dwpmate.meta" "window=fm:fm-dwpmate" "worktree=$d/wt" \
+    "kind=secondmate" "mode=secondmate" "home=$d/wt"
+  printf 'done: routed item landed\n' > "$d/state/dwpmate.status"
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_BUSY=0
+  out=$(run_crew_state "$d" dwpmate)
+  assert_contains "$out" "state: done" "mode=secondmate is not a delivery contract"
+  assert_not_contains "$out" "NOT FINISHED" "a secondmate must not be flagged"
+  pass "an absent mode and mode=secondmate stay silent"
+}
+
+# A done that DOES carry a full https:// URL is untouched on every mode. The test
+# is deliberately forge-agnostic on the reader's side too: a GitLab merge-request
+# URL passes the same way a GitHub pull URL does.
+test_done_with_pr_url_is_unaffected_on_every_mode() {
+  local out mode
+  for mode in no-mistakes direct-PR local-only; do
+    out=$(run_idle_log_case "dwp-url-$mode" dwpurl \
+      'done: PR https://github.com/o/r/pull/9 checks green' "mode=$mode")
+    assert_contains "$out" "state: done" "a done carrying a PR URL still reads done on mode=$mode"
+    assert_not_contains "$out" "NOT FINISHED" "a done carrying a PR URL is never flagged on mode=$mode"
+  done
+  out=$(run_idle_log_case dwp-url-mr dwpmr \
+    'done: MR https://gitlab.example.com/grp/sub/proj/-/merge_requests/4 checks green' \
+    "mode=no-mistakes")
+  assert_contains "$out" "state: done" "a merge-request URL satisfies the rule too"
+  pass "a done carrying a PR URL is unaffected on every mode"
+}
+
+# Only the `done:` verb is judged. A nonterminal or differently-terminal line
+# under a PR-shipping mode keeps its existing state exactly.
+test_other_verbs_unaffected_under_a_pr_mode() {
+  local out
+  out=$(run_idle_log_case dwp-working dwpwork 'working: implementing the strip' "mode=no-mistakes")
+  assert_contains "$out" "state: working" "working: is untouched under a PR mode"
+  assert_not_contains "$out" "NOT FINISHED" "working: is never flagged"
+  out=$(run_idle_log_case dwp-blocked dwpblock 'blocked: needs a credential' "mode=no-mistakes")
+  assert_contains "$out" "state: blocked" "blocked: is untouched under a PR mode"
+  assert_contains "$out" "needs a credential" "blocked: keeps its own reason as the detail"
+  assert_not_contains "$out" "NOT FINISHED" "blocked: is never flagged"
+  pass "only done: is judged under a PR-shipping mode"
+}
+
+# With a run attributed, this reader's standing precedence rule is that the
+# run-step outranks the log. A CI-ready claim naming no PR names nothing to
+# check, so it must not win over a monitoring run - and the answer comes from the
+# run, not from a log-derived `blocked`.
+test_ci_ready_done_without_pr_defers_to_the_run_step() {
+  reset_fakes
+  local d out; d=$(new_case dwp-ciready)
+  make_repo_on_branch "$d/wt" fm/dwpci
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/dwpci.meta" "window=fm:fm-dwpci" "worktree=$d/wt" \
+    "kind=ship" "mode=no-mistakes"
+  printf 'done: PR checks green\n' > "$d/state/dwpci.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/dwpci)"
+  out=$(run_crew_state "$d" dwpci)
+  assert_not_contains "$out" "state: done" "a URL-less ci-ready claim must not beat the monitoring run"
+  assert_contains "$out" "state: working" "the attributed run answers instead"
+  assert_contains "$out" "source: run-step" "precedence stays with the run-step, not a log-derived verdict"
+  # Control on the same fixture: the same line WITH a URL still wins, exactly as
+  # test_ci_ready_done_log_beats_monitoring_run pins for a mode-less task.
+  printf 'done: PR https://github.com/o/r/pull/2 checks green\n' > "$d/state/dwpci.status"
+  out=$(run_crew_state "$d" dwpci)
+  assert_contains "$out" "state: done" "the same claim with a PR URL still reports done"
+  assert_contains "$out" "source: status-log" "and still comes from the status log"
+  pass "a URL-less ci-ready claim defers to the run-step, with a URL unchanged"
+}
+
 test_dead_window_ignores_stale_status_log() {
   reset_fakes
   local d; d=$(new_case dead-window)
@@ -1583,6 +1738,12 @@ test_no_run_idle_pane_uses_keyed_log
 test_no_run_idle_pane_paused
 test_no_run_idle_pane_custom_paused_verb
 test_no_run_idle_secondmate_resolved_event_not_state
+test_done_without_pr_on_pr_modes_is_not_finished
+test_done_without_pr_on_local_only_is_unchanged
+test_done_without_pr_stays_silent_without_a_pr_mode
+test_done_with_pr_url_is_unaffected_on_every_mode
+test_other_verbs_unaffected_under_a_pr_mode
+test_ci_ready_done_without_pr_defers_to_the_run_step
 test_dead_window_ignores_stale_status_log
 test_dead_window_still_reports_terminal_run_step
 test_dead_window_still_reports_active_run_step
