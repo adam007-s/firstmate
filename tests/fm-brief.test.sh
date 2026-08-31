@@ -382,6 +382,78 @@ test_ship_project_memory_wording() {
   pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
 }
 
+# The review cap is unconditional in every no-mistakes ship brief: firstmate has
+# to remember nothing and pass no flag. It exists because the pipeline's review
+# loop parked one task four times on info-severity wording and duplication
+# findings, costing a firstmate decision turn each time for changes no owner
+# would see. The four parts that made the hand-written version work are pinned
+# here: the info-severity threshold, record-instead-of-fix, the named escape
+# hatch for a real defect, and the list of what never qualifies.
+test_no_mistakes_brief_caps_the_review_loop() {
+  local home id brief record
+  home="$TMP_ROOT/review-cap-home"
+  mkdir -p "$home/data"
+  id="brief-review-cap-e1"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode no-mistakes >/dev/null 2>&1 \
+    || fail "no-mistakes brief scaffold failed"
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "brief was not scaffolded"
+  record="$(CDPATH='' cd -- "$home/data" && pwd -P)/$id/remaining-findings.md"
+
+  assert_grep "Cap the review loop." "$brief" \
+    "no-mistakes brief did not cap the review loop"
+  assert_grep "Fix genuine defects the review finds" "$brief" \
+    "review cap did not keep fixing genuine defects as the baseline"
+  assert_grep "The cap decides what is worth fixing; it never decides who answers." "$brief" \
+    "review cap must state that it governs severity and never authority"
+  assert_grep "classifies as \`ask-user\` is never yours to approve, fix, or skip, at any severity" "$brief" \
+    "review cap must leave ask-user routing intact at every severity"
+  assert_grep "Every bullet below applies only to findings that are already yours to decide." "$brief" \
+    "review cap must scope its remaining bullets to worker-decidable findings"
+  assert_grep "Unless it is the genuine correctness or security defect the next bullet names, at \`info\` severity approve the finding unfixed and record it verbatim in \`$record\` instead." "$brief" \
+    "review cap must name the info-severity threshold and the absolute record path"
+  assert_grep "Do not fix it, do not polish it, and do not stop to ask about it." "$brief" \
+    "review cap must forbid both fixing and parking on an info finding"
+  assert_grep "authorized exception to the rule keeping you inside the worktree" "$brief" \
+    "review cap must authorize the one write it asks for outside the worktree"
+  assert_grep "Regardless of severity, including \`info\`, stop with \`needs-decision\` only for a genuine correctness or security defect." "$brief" \
+    "review cap lost the escape hatch for a real defect"
+  assert_grep "Producing a wrong result, losing data, corrupting a record, and exposing it are examples of that, not the whole of it." "$brief" \
+    "review cap must keep its defect list as examples rather than a definition"
+  assert_grep "Wording, naming, structure, duplication, and documentation never qualify" "$brief" \
+    "review cap must list what never justifies stopping"
+  assert_grep "Take on no new refactors, no scope broadening, and no tidiness work." "$brief" \
+    "review cap lost the scope-broadening ban"
+
+  # The cap bounds the no-mistakes review loop, so it belongs only to the mode
+  # that has one. The faster paths run no pipeline and a scout produces a report
+  # rather than a validation run; a cap there would be dead instruction.
+  # Each absence below is only evidence if the brief it reads was really
+  # generated: assert_no_grep is a negated grep, and grep on a missing file
+  # exits 2, so an unscaffolded brief would pass every one of them vacuously.
+  local mode other
+  for mode in direct-PR local-only; do
+    other="brief-review-cap-$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]')"
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$other" some-proj --mode "$mode" >/dev/null 2>&1 \
+      || fail "$mode brief scaffold failed"
+    assert_present "$home/data/$other/brief.md" "$mode brief was not scaffolded"
+    assert_grep "Delivery contract: mode=$mode" "$home/data/$other/brief.md" \
+      "$mode brief did not render its own delivery contract"
+    assert_no_grep "Cap the review loop." "$home/data/$other/brief.md" \
+      "$mode brief carries a review cap for a pipeline it never runs"
+    assert_no_grep "remaining-findings.md" "$home/data/$other/brief.md" \
+      "$mode brief points at a findings record it never writes"
+  done
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-review-cap-scout some-proj --scout >/dev/null 2>&1 \
+    || fail "scout brief scaffold failed"
+  assert_present "$home/data/brief-review-cap-scout/brief.md" "scout brief was not scaffolded"
+  assert_grep "This is a SCOUT task: the deliverable is a written report, not a PR." \
+    "$home/data/brief-review-cap-scout/brief.md" "scout brief did not render its own contract"
+  assert_no_grep "Cap the review loop." "$home/data/brief-review-cap-scout/brief.md" \
+    "scout brief carries a review cap for a validation run it never has"
+  pass "fm-brief.sh: every no-mistakes ship brief caps the review loop, and only that mode does"
+}
+
 test_herdr_lab_contract_is_explicit_and_complete() {
   local home id brief
   home="$TMP_ROOT/herdr-lab-home"
@@ -771,6 +843,7 @@ test_ship_mode_is_explicit_not_registry
 test_delivery_flags_are_refused_where_they_do_not_apply
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
+test_no_mistakes_brief_caps_the_review_loop
 test_ship_project_memory_wording
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path

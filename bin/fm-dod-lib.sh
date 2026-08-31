@@ -5,16 +5,42 @@
 # receives. Both paths must hand the worker the same contract: a promoted
 # no-mistakes worker that never received the ask-user escalation rule or the
 # `--yes` ban is the exact delivery hole this single owner exists to close.
-# fm_dod_block <no-mistakes|direct-PR|local-only> <task-id> prints the block on
-# stdout with no trailing blank line. The caller validates the mode; an unknown
-# mode is refused rather than silently rendered as the pipeline contract.
+# fm_dod_block <no-mistakes|direct-PR|local-only> <task-id> <data-dir> prints the
+# block on stdout with no trailing blank line. The caller validates the mode; an
+# unknown mode is refused rather than silently rendered as the pipeline contract.
+# <data-dir> is the firstmate home's data directory. It is required for every
+# mode so a caller cannot forget it on the one mode that reads it, and it is
+# resolved to its physical path here rather than by each caller, so the brief
+# scaffold and a scout promotion render byte-identical blocks even when their
+# own FM_HOME resolution differs (tests/fm-task-delivery.test.sh compares them).
+# Only the no-mistakes block uses it, for the record the review cap writes to.
+# That cap is part of this contract because the pipeline's review loop is what
+# it bounds: a run that parks repeatedly on info-severity wording, naming, or
+# duplication findings costs a firstmate decision turn each time and changes
+# nothing an owner would see. Recording those findings instead of fixing them
+# keeps them from being silently dropped, and the record lives in the firstmate
+# home rather than the worktree so it survives the worktree being discarded.
+# The cap governs severity, never authority: it decides what is worth fixing and
+# never who answers. An ask-user finding still routes to firstmate at every
+# severity, so the block states that boundary out loud rather than leaving a
+# worker who reads only the brief to rank the two rules against each other.
+# Defect nature outranks severity on the same principle: a genuine correctness or
+# security defect is fixed or escalated however quietly the review labelled it,
+# and severity governs only how much polish is worth doing. Both the info-severity
+# bullet and the escape hatch carry that precedence so neither reads wrong alone.
 # The block opens with the fixed machine-readable "Delivery contract: mode=<mode>"
 # line that bin/fm-spawn.sh checks a ship brief against.
 # Every heredoc here stays outside a command substitution: `VAR=$(cat <<EOF ...)`
 # breaks parsing of the whole file on Bash 3.2 (tests/fm-brief.test.sh).
 
-fm_dod_block() {  # <mode> <task-id>
-  local mode=$1 id=$2
+fm_dod_block() {  # <mode> <task-id> <data-dir>
+  local mode=$1 id=$2 data=${3:-} findings
+  if [ -z "$data" ]; then
+    echo "error: fm_dod_block: the firstmate data directory is required" >&2
+    return 1
+  fi
+  findings=$(CDPATH='' cd -- "$data" 2>/dev/null && pwd -P) || findings=${data%/}
+  findings="${findings%/}/$id/remaining-findings.md"
   case "$mode" in
     direct-PR)
       cat <<EOF
@@ -56,6 +82,12 @@ Two firstmate-specific rules layer on top of that guidance:
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
 - NEVER pass \`--yes\` (or \`-y\`) to \`no-mistakes axi run\` or \`no-mistakes axi respond\`. It is banned fleet-wide.
   It auto-resolves every gate including ask-user findings with no escalation, and answering your own ask-user finding is a hard rule violation.
+
+Cap the review loop. Fix genuine defects the review finds, and do not let cosmetic ones park the run:
+- The cap decides what is worth fixing; it never decides who answers. A finding the pipeline classifies as \`ask-user\` is never yours to approve, fix, or skip, at any severity - route it to firstmate exactly as the rule above requires and apply only the decision that comes back. Every bullet below applies only to findings that are already yours to decide.
+- Unless it is the genuine correctness or security defect the next bullet names, at \`info\` severity approve the finding unfixed and record it verbatim in \`$findings\` instead. Do not fix it, do not polish it, and do not stop to ask about it. Writing that one record is an authorized exception to the rule keeping you inside the worktree; it lives outside the worktree so it survives after the worktree is discarded.
+- Regardless of severity, including \`info\`, stop with \`needs-decision\` only for a genuine correctness or security defect. Producing a wrong result, losing data, corrupting a record, and exposing it are examples of that, not the whole of it. Wording, naming, structure, duplication, and documentation never qualify, whatever severity they carry.
+- Take on no new refactors, no scope broadening, and no tidiness work.
 
 After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
 EOF
