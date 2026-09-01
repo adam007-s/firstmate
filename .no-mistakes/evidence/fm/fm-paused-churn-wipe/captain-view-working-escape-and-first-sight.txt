@@ -1,0 +1,16 @@
+==============================================================
+ SCENARIO 2: the crew that declared a wait has genuinely RESUMED
+ (authoritative crew state says working; its pane redrew this poll)
+ expected: the wait is retired and the wedge timer supervises again,
+ so a real freeze after the wait still escalates
+==============================================================
+  other-instance variant        wait retired on the redrawing poll: NO    wedge timer supervising again: yes
+  THIS fix (9247dea)            wait retired on the redrawing poll: yes   wedge timer supervising again: yes
+
+==============================================================
+ SCENARIO 3: a FRESH declared wait behind an already-surfaced suppressor
+ (the pane was surfaced as ordinary stale before the worker declared it)
+ expected: the captain is told NOW, not a whole cadence later
+==============================================================
+  prior commit 4bb14e2          silent - first notification delayed by up to PAUSE_RESURFACE_SECS
+  THIS fix (9247dea)            CAPTAIN NOTIFIED NOW:  stale: grok:fm-fresh

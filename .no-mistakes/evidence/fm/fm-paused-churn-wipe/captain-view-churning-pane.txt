@@ -1,0 +1,41 @@
+Captain's-eye transcript: a LIVE crew's declared wait on a redrawing pane.
+Real fm-watch.sh processes over the hermetic fake tmux backend; each poll round
+re-seeds .hash-<key> to a value the pane no longer renders, which is the
+watcher's own definition of "the bytes moved since the last poll" (a ticking
+clock or token counter in the field). Only the fm-watch.sh binary differs
+between the two halves.
+
+==============================================================
+ BEFORE the fix (base ae029fc)
+ crew grok:fm-ship is ALIVE and has declared: 'paused: awaiting the upstream release'
+ its pane redraws between every poll (ticking clock / token counter)
+==============================================================
+poll round 1 (pane redrew)  ->  CAPTAIN NOTIFIED:  stale: grok:fm-ship
+poll round 2 (pane redrew)  ->  CAPTAIN NOTIFIED:  stale: grok:fm-ship
+poll round 3 (pane redrew)  ->  CAPTAIN NOTIFIED:  stale: grok:fm-ship
+poll round 4 (pane redrew)  ->  CAPTAIN NOTIFIED:  stale: grok:fm-ship
+poll round 5 (pane redrew)  ->  CAPTAIN NOTIFIED:  stale: grok:fm-ship
+--------------------------------------------------------------
+captain interruptions over 5 redraw rounds: 5
+pause tracking still held after the rounds: .paused-grok_fm-ship=present .paused-resurfaced-grok_fm-ship=present
+
+after the wait ages past PAUSE_RESURFACE_SECS (240s), next redraw round:
+  CAPTAIN NOTIFIED:  stale: grok:fm-ship
+
+==============================================================
+ AFTER the fix (9247dea)
+ crew grok:fm-ship is ALIVE and has declared: 'paused: awaiting the upstream release'
+ its pane redraws between every poll (ticking clock / token counter)
+==============================================================
+poll round 1 (pane redrew)  ->  CAPTAIN NOTIFIED:  stale: grok:fm-ship
+poll round 2 (pane redrew)  ->  quiet (absorbed on the bounded cadence)
+poll round 3 (pane redrew)  ->  quiet (absorbed on the bounded cadence)
+poll round 4 (pane redrew)  ->  quiet (absorbed on the bounded cadence)
+poll round 5 (pane redrew)  ->  quiet (absorbed on the bounded cadence)
+--------------------------------------------------------------
+captain interruptions over 5 redraw rounds: 1
+pause tracking still held after the rounds: .paused-grok_fm-ship=present .paused-resurfaced-grok_fm-ship=present
+
+after the wait ages past PAUSE_RESURFACE_SECS (240s), next redraw round:
+  CAPTAIN NOTIFIED:  stale: grok:fm-ship (paused 502s, awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds)
+

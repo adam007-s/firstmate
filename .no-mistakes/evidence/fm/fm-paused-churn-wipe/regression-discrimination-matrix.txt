@@ -1,0 +1,62 @@
+Regression discrimination matrix for the three new tests in
+tests/fm-watch-triage.test.sh. Each cell is a real run of the test against a
+watcher build that differs ONLY in the changed-hash branch of the pane-staleness
+loop. A regression that passes everywhere would prove nothing; these fail on the
+builds that carry the defect they describe.
+
+build                                            test 1        test 2        test 3
+                                                 live churn    working       first-sight
+                                                 survives      retires       suppressor
+------------------------------------------------------------------------------------
+base ae029fc (`*) clear_pause_tracking`)          FAIL          pass          FAIL
+other-instance variant (`*) handle_paused_stale`) FAIL          FAIL          FAIL
+prior commit 4bb14e2 (no-op `else`)               pass          pass          FAIL
+target 9247dea (this change)                      pass          pass          pass
+
+test 1 = test_live_declared_pause_survives_a_churning_pane
+test 2 = test_churning_pane_authoritative_working_retires_the_pause
+test 3 = test_first_sight_declared_pause_clears_a_stale_suppressor
+
+Observed failure messages
+-------------------------
+base ae029fc, test 1:
+  not ok - round 1: a redrawing pane re-surfaced an already-surfaced declared wait
+base ae029fc, test 3:
+  not ok - clearing the suppressor on a first sighting reinstated the per-stabilisation flood
+other-instance variant, test 1:
+  not ok - a live crew's declared wait did not surface on first sight
+other-instance variant, test 2:
+  not ok - a resumed crew kept the pause cadence on a redrawing pane
+other-instance variant, test 3:
+  not ok - a freshly declared wait behind an already-surfaced suppressor was absorbed
+           instead of surfaced, delaying its first notification by a whole cadence
+prior commit 4bb14e2, test 3:
+  not ok - a freshly declared wait behind an already-surfaced suppressor was absorbed
+           instead of surfaced, delaying its first notification by a whole cadence
+
+Target-commit run of the three new tests
+----------------------------------------
+ok - a live crew's declared wait survives a redrawing pane: surfaced once, then rechecked on the bounded cadence
+ok - a resumed crew retires its declared wait on a redrawing pane and returns to the wedge timer
+ok - a first sighting clears an already-surfaced suppressor so a fresh declared wait surfaces now, then stays on the bounded cadence
+
+Adjacent pause/stale/secondmate/away-mode behaviour the intent puts out of scope
+(17 pre-existing tests from the same suite, all still passing on 9247dea)
+--------------------------------------------------------------------------------
+ok - a not-provably-working non-terminal stale is surfaced immediately (never left to wait out the timer)
+ok - a declared pause is absorbed on first sight, then re-surfaced as a recheck past the threshold, never wedge-escalated
+ok - exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once
+ok - a declared paused secondmate re-surfaces on the bounded normal-mode cadence
+ok - a captain-held secondmate re-surfaces on the bounded normal-mode cadence
+ok - a non-paused secondmate retains normal stale suppression
+ok - a resumed secondmate clears pause and stale tracking before stale exemption
+ok - unchanged stale hashes reclassify when a crew enters or leaves pause
+ok - a declared pause is periodically rechecked against authoritative active-run state
+ok - a paused status overridden by authoritative working preserves its wedge timer and escalates
+ok - a busy pane under a declared pause is rechecked on the long cadence, and lifting the pause restores the wedge escalation
+ok - away mode hands a busy declared pause to the daemon as a plain stale, and lifting the declaration restores the wedge escalation
+ok - away mode wakes the daemon once per declaration for a busy pane whose footer ticks on every capture
+ok - AFK changed paused panes hand off plain stale identities for daemon-owned pause triage
+ok - a write deferral re-surfaces once on the bounded pause cadence, so a churning worktree cannot stay invisible
+ok - provably-working non-terminal stale is absorbed on first sight, then wedge-escalated past the threshold
+ok - a pane becoming active again resets the consecutive wedge-escalation counter
