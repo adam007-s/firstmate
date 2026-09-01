@@ -1917,13 +1917,25 @@ EOF
         # the pane to wedge-timer supervision. Once the wait has been surfaced at
         # least once ($pf exists) anything else takes the bounded cadence, whose age
         # handle_paused_stale anchors on the status file rather than a per-hash
-        # marker precisely so a churny pane cannot keep resetting it; a first
-        # sighting is left untouched so it still surfaces promptly through the
-        # ordinary path.
+        # marker precisely so a churny pane cannot keep resetting it.
+        #
+        # With no tracking yet the clear stays, because it is what guarantees the
+        # prompt FIRST surface: the ordinary first-sight path only surfaces when
+        # .stale-<key> differs from the current hash, so an already-surfaced
+        # suppressor left in place - the pane surfaced as ordinary non-terminal
+        # stale, or the away-mode arm suppressed it, before the worker declared the
+        # wait - would instead route the fresh declaration to the bounded cadence
+        # and delay its first notification by up to PAUSE_RESURFACE_SECS. Clearing
+        # there cannot reinstate the flood above, because the sequence self-limits:
+        # surface_nonterminal_stale writes .paused-<key>, .paused-rechecked-<key>
+        # and .paused-resurfaced-<key> whenever the log declares the wait, so the
+        # clear happens only while $pf is absent, the very next stable-hash poll
+        # surfaces once AND establishes the tracking, and every later redrawing poll
+        # then takes handle_paused_stale. One prompt surface, then the cadence.
         case "$(pause_state_class "$w" "$task")" in
           paused)  handle_paused_stale "$w" "$task" "$h" ;;
           working) clear_pause_tracking "$key" ;;
-          *)       if [ -e "$pf" ]; then handle_paused_stale "$w" "$task" "$h"; fi ;;
+          *)       if [ -e "$pf" ]; then handle_paused_stale "$w" "$task" "$h"; else clear_pause_tracking "$key"; fi ;;
         esac
       elif [ "$paused_bound" -ne 0 ] && [ -e "$pf" ]; then
         # Same rule as the stable-hash branch: never clear pause bookkeeping the

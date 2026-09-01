@@ -2210,6 +2210,84 @@ test_churning_pane_authoritative_working_retires_the_pause() {
   pass "a resumed crew retires its declared wait on a redrawing pane and returns to the wedge timer"
 }
 
+# The edge the changed-hash branch's no-tracking case exists for. .stale-<key>
+# can already equal the pane's current hash while .paused-<key> is absent - the
+# pane surfaced as ordinary non-terminal stale, or the away-mode arm suppressed
+# it, before the worker declared the wait. The ordinary first-sight path only
+# surfaces when that suppressor differs from the current hash, so leaving it in
+# place routes a freshly declared wait straight to the bounded cadence, and with
+# a recent declaration handle_paused_stale absorbs it silently: the captain's
+# first notification is delayed by up to PAUSE_RESURFACE_SECS. Clearing there is
+# self-limiting rather than a return to the flood, because surface_nonterminal_stale
+# establishes the pause tracking as it surfaces, which is what phase B pins.
+test_first_sight_declared_pause_clears_a_stale_suppressor() {
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid cycles wakes
+  dir=$(make_case first-sight-stale-suppressor); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/first-sight.status"
+  window="test:fm-first-sight-churn"
+  printf 'idle holding for the upstream release\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/first-sight.meta"
+  # A FRESH declaration: a recent status line is what makes the delayed-absorb
+  # failure mode observable, because handle_paused_stale would not wake on it.
+  printf 'paused: holding for the upstream release\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-first-sight_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle holding for the upstream release")
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · holding for the upstream release'
+
+  # Phase A: the suppressor already names this pane and nothing carries pause
+  # tracking, and the bytes have just moved. The declared wait must still reach
+  # the captain now, not once the cadence eventually comes round.
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf 'redrawn-since-the-last-poll' > "$state/.hash-$key"
+  printf '0\n' > "$state/.count-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || fail "a freshly declared wait behind an already-surfaced suppressor was absorbed instead of surfaced, delaying its first notification by a whole cadence"
+  grep -F "stale: $window" "$out" >/dev/null \
+    || fail "the first surface did not carry the plain first-sight identity: $(cat "$out")"
+  grep -F "awaiting external" "$out" >/dev/null \
+    && fail "the first sighting used the bounded recheck wording instead of surfacing promptly"
+  [ -e "$state/.paused-$key" ] \
+    || fail "the first surface did not establish the pause tracking that bounds every later poll"
+  [ -e "$state/.paused-resurfaced-$key" ] \
+    || fail "the first surface did not record the re-surface throttle"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the first-sight declared-wait surface"
+
+  # Phase B: that clear is self-limiting, not a flood. The wait now carries
+  # tracking, so the next redraw takes the bounded cadence instead of surfacing.
+  printf 'redrawn-since-the-last-poll-again' > "$state/.hash-$key"
+  printf '0\n' > "$state/.count-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  cycles=1
+  while [ "$cycles" -le 4 ]; do
+    wait_poll_cycle "$state" "$pid" || break
+    cycles=$((cycles + 1))
+  done
+  reap "$pid"
+  [ -e "$state/.paused-$key" ] || fail "the tracked wait lost its pause tracking on the next redraw"
+  [ -e "$state/.paused-resurfaced-$key" ] || fail "the tracked wait lost its re-surface throttle on the next redraw"
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] \
+    || fail "the tracked wait lost its already-surfaced suppressor on the next redraw"
+  [ "$(cat "$state/.hash-$key" 2>/dev/null || true)" = "$pane_hash" ] \
+    || fail "the watcher never observed the redrawn pane"
+  grep -F "stale: $window" "$out" >/dev/null \
+    && fail "clearing the suppressor on a first sighting reinstated the per-stabilisation flood"
+  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null || echo 0)
+  [ "$wakes" -eq 0 ] || fail "an already-surfaced declared wait queued $wakes further stale wakes"
+  unset FM_FAKE_CREW_STATE
+  pass "a first sighting clears an already-surfaced suppressor so a fresh declared wait surfaces now, then stays on the bounded cadence"
+}
+
 test_secondmate_paused_resurfaces_in_normal_mode() {
   local dir state fakebin out capture_file statusf window key pane_hash sig pid back
   dir=$(make_case secondmate-paused-resurface); state="$dir/state"; fakebin="$dir/fakebin"
@@ -4018,6 +4096,7 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
 test_live_declared_pause_survives_a_churning_pane
 test_churning_pane_authoritative_working_retires_the_pause
+test_first_sight_declared_pause_clears_a_stale_suppressor
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_captain_held_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
