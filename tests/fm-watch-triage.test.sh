@@ -2054,6 +2054,240 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   pass "exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once"
 }
 
+# The churning-pane hole in the bounded declared-wait cadence. A LIVE ordinary
+# crew's declared wait reaches pause_state_class as `none` by design (its header
+# owns why: `paused` is recovered only for a confidently dead ordinary crew or
+# for a secondmate), so the changed-hash branch used to read that expected
+# verdict as proof the wait had ended and wipe the pause bookkeeping on every
+# poll a redraw moved the pane's bytes. The re-surface throttle and the
+# already-surfaced stale suppressor went with it, so each time the pane next
+# held still the same declared wait looked brand new and surfaced again instead
+# of once per PAUSE_RESURFACE_SECS. Each round below re-seeds .hash-<key> to a
+# value the pane no longer renders - the watcher's own definition of "the bytes
+# moved since the last poll", the shape a ticking clock or token counter
+# produces in the field - and then lets the static pane hold still long enough
+# for the stale path to run, which is exactly the alternation that flooded.
+test_live_declared_pause_survives_a_churning_pane() {
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid round cycles wakes back
+  dir=$(make_case live-paused-churning-pane); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/churn.status"
+  window="test:fm-churn"
+  printf 'idle awaiting the upstream release\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/churn.meta"
+  printf 'paused: awaiting the upstream release\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-churn_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle awaiting the upstream release")
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting the upstream release'
+
+  # Phase A: a FIRST sighting whose bytes have already moved must still surface
+  # promptly, so a live crew's gate is never hidden behind the cadence it is
+  # about to enter. Nothing carries pause tracking yet, which is what separates
+  # this poll from every round below.
+  printf 'redrawn-before-the-first-sighting' > "$state/.hash-$key"
+  printf '0\n' > "$state/.count-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "a live crew's declared wait did not surface on first sight"
+  [ -e "$state/.paused-$key" ] || fail "first sight did not start the bounded declared-wait cadence"
+  [ -e "$state/.paused-resurfaced-$key" ] || fail "first sight did not record the re-surface throttle"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the first-sight declared-wait surface"
+
+  # Phase B: several churn-then-hold-still rounds. Every round must absorb: the
+  # bookkeeping the first surface established has to outlive the redraws, or the
+  # cadence restarts from scratch on each stabilisation.
+  round=1
+  while [ "$round" -le 3 ]; do
+    printf 'redrawn-since-the-last-poll-%s' "$round" > "$state/.hash-$key"
+    printf '0\n' > "$state/.count-$key"
+    : > "$out"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+    pid=$!
+    cycles=1
+    while [ "$cycles" -le 4 ]; do
+      wait_poll_cycle "$state" "$pid" || break
+      cycles=$((cycles + 1))
+    done
+    reap "$pid"
+    [ -e "$state/.paused-$key" ] \
+      || fail "round $round: a redrawing pane discarded the declared wait's pause tracking"
+    [ -e "$state/.paused-resurfaced-$key" ] \
+      || fail "round $round: a redrawing pane discarded the declared wait's re-surface throttle"
+    [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] \
+      || fail "round $round: a redrawing pane discarded the already-surfaced stale suppressor"
+    [ ! -e "$state/.stale-since-$key" ] \
+      || fail "round $round: a declared wait on a redrawing pane started the wedge timer"
+    # The round is only meaningful if the watcher actually saw the redraw: it
+    # adopts the hash it captured, replacing the seeded value the pane no longer
+    # renders. Without this the round could pass having never polled at all.
+    [ "$(cat "$state/.hash-$key" 2>/dev/null || true)" = "$pane_hash" ] \
+      || fail "round $round: the watcher never observed the redrawn pane"
+    grep -F "stale: $window" "$out" >/dev/null \
+      && fail "round $round: a redrawing pane re-surfaced an already-surfaced declared wait"
+    wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null || echo 0)
+    [ "$wakes" -eq 0 ] \
+      || fail "round $round: a redrawing pane queued $wakes stale wakes for an already-surfaced wait"
+    # Reaping a watcher leaves downtime-recovery state behind, exactly as a
+    # restarted watcher does in the field. Consume it the way a handling turn
+    # does, so the next round measures the pause cadence and not that recovery.
+    ack_stopped_cycle "$state" || fail "round $round: could not consume the watcher recovery state"
+    round=$((round + 1))
+  done
+
+  # Phase C: the cadence is bounded, not silent. Age the wait and its throttle
+  # past PAUSE_RESURFACE_SECS and the very next redraw must recheck it as the
+  # declared wait it is, never as a fresh stale pane or a possible wedge.
+  back=$(( $(date +%s) - 500 ))
+  set_mtime "$back" "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-churn_status"
+  set_mtime "$back" "$state/.paused-resurfaced-$key"
+  printf 'redrawn-since-the-last-poll-final' > "$state/.hash-$key"
+  printf '0\n' > "$state/.count-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "a redrawing pane never reached the bounded declared-wait recheck"
+  grep -F "awaiting external" "$out" >/dev/null \
+    || fail "the redrawing pane's recheck was not labeled a declared-wait recheck: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null \
+    && fail "a declared wait on a redrawing pane was mislabeled a possible wedge"
+  unset FM_FAKE_CREW_STATE
+  pass "a live crew's declared wait survives a redrawing pane: surfaced once, then rechecked on the bounded cadence"
+}
+
+# The `working` escape on that same changed-hash branch. A crew that declared a
+# wait and then genuinely resumed must lose the pause cadence and go back to
+# wedge-timer supervision, so a real freeze after the wait still escalates.
+# test_paused_authoritative_working_preserves_wedge_timer pins this for the
+# unchanged-hash sibling; nothing pinned it here, where the pane's bytes moved.
+test_churning_pane_authoritative_working_retires_the_pause() {
+  local dir state fakebin out capture_file window key pane_hash sig pid wakes
+  dir=$(make_case churning-paused-working); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-churn-working"
+  printf 'idle awaiting external\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/churn-working.meta"
+  printf 'paused: awaiting the upstream release\n' > "$state/churn-working.status"
+  sig=$(seen_sig "$state/churn-working.status")
+  printf '%s' "$sig" > "$state/.seen-churn-working_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle awaiting external")
+  # The wait was already surfaced once and is on the bounded cadence, and the
+  # pane's bytes have just moved. No .paused-rechecked-<key>, so pause_state_class
+  # reads authoritative crew state instead of short-circuiting on liveness.
+  printf 'redrawn-since-the-last-poll' > "$state/.hash-$key"
+  printf '0\n' > "$state/.count-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  : > "$state/.paused-$key"
+  date +%s > "$state/.paused-resurfaced-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_poll_cycle "$state" "$pid" \
+    || { reap "$pid"; fail "a resumed crew's redrawing pane surfaced instead of retiring its wait: $(cat "$out")"; }
+  [ ! -e "$state/.paused-$key" ] \
+    || { reap "$pid"; fail "a resumed crew kept the pause cadence on a redrawing pane"; }
+  [ ! -e "$state/.paused-resurfaced-$key" ] \
+    || { reap "$pid"; fail "a resumed crew kept the pause re-surface throttle on a redrawing pane"; }
+  wait_numeric_file "$state/.stale-since-$key" 100 \
+    || { reap "$pid"; fail "a resumed crew did not return to wedge-timer supervision"; }
+  reap "$pid"
+  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null || echo 0)
+  [ "$wakes" -eq 0 ] || fail "a resumed crew's redrawing pane surfaced $wakes stale wakes"
+  unset FM_FAKE_CREW_STATE
+  pass "a resumed crew retires its declared wait on a redrawing pane and returns to the wedge timer"
+}
+
+# The edge the changed-hash branch's no-tracking case exists for. .stale-<key>
+# can already equal the pane's current hash while .paused-<key> is absent - the
+# pane surfaced as ordinary non-terminal stale, or the away-mode arm suppressed
+# it, before the worker declared the wait. The ordinary first-sight path only
+# surfaces when that suppressor differs from the current hash, so leaving it in
+# place routes a freshly declared wait straight to the bounded cadence, and with
+# a recent declaration handle_paused_stale absorbs it silently: the captain's
+# first notification is delayed by up to PAUSE_RESURFACE_SECS. Clearing there is
+# self-limiting rather than a return to the flood, because surface_nonterminal_stale
+# establishes the pause tracking as it surfaces, which is what phase B pins.
+test_first_sight_declared_pause_clears_a_stale_suppressor() {
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid cycles wakes
+  dir=$(make_case first-sight-stale-suppressor); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/first-sight.status"
+  window="test:fm-first-sight-churn"
+  printf 'idle holding for the upstream release\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/first-sight.meta"
+  # A FRESH declaration: a recent status line is what makes the delayed-absorb
+  # failure mode observable, because handle_paused_stale would not wake on it.
+  printf 'paused: holding for the upstream release\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-first-sight_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle holding for the upstream release")
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · holding for the upstream release'
+
+  # Phase A: the suppressor already names this pane and nothing carries pause
+  # tracking, and the bytes have just moved. The declared wait must still reach
+  # the captain now, not once the cadence eventually comes round.
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf 'redrawn-since-the-last-poll' > "$state/.hash-$key"
+  printf '0\n' > "$state/.count-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || fail "a freshly declared wait behind an already-surfaced suppressor was absorbed instead of surfaced, delaying its first notification by a whole cadence"
+  grep -F "stale: $window" "$out" >/dev/null \
+    || fail "the first surface did not carry the plain first-sight identity: $(cat "$out")"
+  grep -F "awaiting external" "$out" >/dev/null \
+    && fail "the first sighting used the bounded recheck wording instead of surfacing promptly"
+  [ -e "$state/.paused-$key" ] \
+    || fail "the first surface did not establish the pause tracking that bounds every later poll"
+  [ -e "$state/.paused-resurfaced-$key" ] \
+    || fail "the first surface did not record the re-surface throttle"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the first-sight declared-wait surface"
+
+  # Phase B: that clear is self-limiting, not a flood. The wait now carries
+  # tracking, so the next redraw takes the bounded cadence instead of surfacing.
+  printf 'redrawn-since-the-last-poll-again' > "$state/.hash-$key"
+  printf '0\n' > "$state/.count-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  cycles=1
+  while [ "$cycles" -le 4 ]; do
+    wait_poll_cycle "$state" "$pid" || break
+    cycles=$((cycles + 1))
+  done
+  reap "$pid"
+  [ -e "$state/.paused-$key" ] || fail "the tracked wait lost its pause tracking on the next redraw"
+  [ -e "$state/.paused-resurfaced-$key" ] || fail "the tracked wait lost its re-surface throttle on the next redraw"
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] \
+    || fail "the tracked wait lost its already-surfaced suppressor on the next redraw"
+  [ "$(cat "$state/.hash-$key" 2>/dev/null || true)" = "$pane_hash" ] \
+    || fail "the watcher never observed the redrawn pane"
+  grep -F "stale: $window" "$out" >/dev/null \
+    && fail "clearing the suppressor on a first sighting reinstated the per-stabilisation flood"
+  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null || echo 0)
+  [ "$wakes" -eq 0 ] || fail "an already-surfaced declared wait queued $wakes further stale wakes"
+  unset FM_FAKE_CREW_STATE
+  pass "a first sighting clears an already-surfaced suppressor so a fresh declared wait surfaces now, then stays on the bounded cadence"
+}
+
 test_secondmate_paused_resurfaces_in_normal_mode() {
   local dir state fakebin out capture_file statusf window key pane_hash sig pid back
   dir=$(make_case secondmate-paused-resurface); state="$dir/state"; fakebin="$dir/fakebin"
@@ -3860,6 +4094,9 @@ test_afk_busy_declared_pause_ticking_pane_hands_off_once
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
+test_live_declared_pause_survives_a_churning_pane
+test_churning_pane_authoritative_working_retires_the_pause
+test_first_sight_declared_pause_clears_a_stale_suppressor
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_captain_held_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed

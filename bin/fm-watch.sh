@@ -1905,9 +1905,37 @@ EOF
       fi
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" && [ "$busy_now" -ne 0 ]; then
+        # The guard above already confirmed the status log still DECLARES the wait,
+        # so a `none` verdict here is not evidence the wait ended: pause_state_class
+        # (its header owns why) recovers `paused` only for a confidently dead
+        # ordinary crew or for a secondmate, so a LIVE ordinary crew's declared wait
+        # arrives as `none` by design. Clearing the bookkeeping on that verdict
+        # discards the re-surface throttle and the already-surfaced suppressor, so
+        # every time this churning pane next holds still the declared wait looks
+        # brand new and surfaces again instead of once per PAUSE_RESURFACE_SECS.
+        # Only `working` - the crew provably resumed - retires the pause and returns
+        # the pane to wedge-timer supervision. Once the wait has been surfaced at
+        # least once ($pf exists) anything else takes the bounded cadence, whose age
+        # handle_paused_stale anchors on the status file rather than a per-hash
+        # marker precisely so a churny pane cannot keep resetting it.
+        #
+        # With no tracking yet the clear stays, because it is what guarantees the
+        # prompt FIRST surface: the ordinary first-sight path only surfaces when
+        # .stale-<key> differs from the current hash, so an already-surfaced
+        # suppressor left in place - the pane surfaced as ordinary non-terminal
+        # stale, or the away-mode arm suppressed it, before the worker declared the
+        # wait - would instead route the fresh declaration to the bounded cadence
+        # and delay its first notification by up to PAUSE_RESURFACE_SECS. Clearing
+        # there cannot reinstate the flood above, because the sequence self-limits:
+        # surface_nonterminal_stale writes .paused-<key>, .paused-rechecked-<key>
+        # and .paused-resurfaced-<key> whenever the log declares the wait, so the
+        # clear happens only while $pf is absent, the very next stable-hash poll
+        # surfaces once AND establishes the tracking, and every later redrawing poll
+        # then takes handle_paused_stale. One prompt surface, then the cadence.
         case "$(pause_state_class "$w" "$task")" in
-          paused) handle_paused_stale "$w" "$task" "$h" ;;
-          *)      clear_pause_tracking "$key" ;;
+          paused)  handle_paused_stale "$w" "$task" "$h" ;;
+          working) clear_pause_tracking "$key" ;;
+          *)       if [ -e "$pf" ]; then handle_paused_stale "$w" "$task" "$h"; else clear_pause_tracking "$key"; fi ;;
         esac
       elif [ "$paused_bound" -ne 0 ] && [ -e "$pf" ]; then
         # Same rule as the stable-hash branch: never clear pause bookkeeping the
