@@ -1905,9 +1905,25 @@ EOF
       fi
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" && [ "$busy_now" -ne 0 ]; then
+        # The guard above already confirmed the status log still DECLARES the wait,
+        # so a `none` verdict here is not evidence the wait ended: pause_state_class
+        # (its header owns why) recovers `paused` only for a confidently dead
+        # ordinary crew or for a secondmate, so a LIVE ordinary crew's declared wait
+        # arrives as `none` by design. Clearing the bookkeeping on that verdict
+        # discards the re-surface throttle and the already-surfaced suppressor, so
+        # every time this churning pane next holds still the declared wait looks
+        # brand new and surfaces again instead of once per PAUSE_RESURFACE_SECS.
+        # Only `working` - the crew provably resumed - retires the pause and returns
+        # the pane to wedge-timer supervision. Once the wait has been surfaced at
+        # least once ($pf exists) anything else takes the bounded cadence, whose age
+        # handle_paused_stale anchors on the status file rather than a per-hash
+        # marker precisely so a churny pane cannot keep resetting it; a first
+        # sighting is left untouched so it still surfaces promptly through the
+        # ordinary path.
         case "$(pause_state_class "$w" "$task")" in
-          paused) handle_paused_stale "$w" "$task" "$h" ;;
-          *)      clear_pause_tracking "$key" ;;
+          paused)  handle_paused_stale "$w" "$task" "$h" ;;
+          working) clear_pause_tracking "$key" ;;
+          *)       if [ -e "$pf" ]; then handle_paused_stale "$w" "$task" "$h"; fi ;;
         esac
       elif [ "$paused_bound" -ne 0 ] && [ -e "$pf" ]; then
         # Same rule as the stable-hash branch: never clear pause bookkeeping the
