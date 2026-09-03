@@ -2629,6 +2629,207 @@ test_wedge_escalation_resets_when_pane_becomes_active() {
   pass "a pane becoming active again resets the consecutive wedge-escalation counter"
 }
 
+# --- wedge escalation backoff: a confirmed-healthy repeat costs fewer turns -
+# fm-stale-during-validation: past FM_WEDGE_DEMAND_INSPECT_COUNT, an escalation
+# whose fresh crew_state_line read is IDENTICAL to the prior escalation's read is
+# confirmation of the same healthy state, not new information, so it must not
+# keep costing a full supervision turn every STALE_ESCALATE_SECS forever.
+
+test_wedge_escalation_backoff_widens_recheck_cadence_on_confirmed_unchanged_state() {
+  local dir state fakebin out capture_file window key pane_hash sig pid n
+  dir=$(make_case wedge-backoff-widen); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-wedged-backoff"
+  printf 'idle building output' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/wedged-backoff.meta"
+  printf 'working: still monitoring ci\n' > "$state/wedged-backoff.status"
+  sig=$(seen_sig "$state/wedged-backoff.status"); printf '%s' "$sig" > "$state/.seen-wedged-backoff_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle building output")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # The crew's pipeline is actively running and its run-step never moves: the
+  # SAME authoritative read on every escalation is exactly the "confirmed
+  # healthy, no new information" case the backoff exists for.
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_poll_cycle "$state" "$pid"; then
+    reap "$pid"; fail "watcher exited on the priming round (should absorb): $(cat "$out")"
+  fi
+  reap "$pid"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional wedge priming stop"
+
+  # Rounds 1-3: reach FM_WEDGE_DEMAND_INSPECT_COUNT on an unchanged read, exactly
+  # as test_wedge_escalation_marks_demand_deep_inspection_after_threshold. Round 3
+  # is the first escalation to see its own read repeated (round 2's), so it earns
+  # the first cadence doubling for round 4.
+  n=1
+  while [ "$n" -le 3 ]; do
+    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    : > "$out"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 100 || fail "watcher did not escalate on consecutive wedge round $n: $(cat "$out")"
+    grep -F "escalation $n" "$out" >/dev/null || fail "round $n did not report escalation count $n: $(cat "$out")"
+    ack_stopped_cycle "$state" || fail "could not acknowledge wedge escalation round $n"
+    n=$((n + 1))
+  done
+  [ "$(cat "$state/.wedge-backoff-$key" 2>/dev/null || echo 1)" = 2 ] \
+    || fail "confirming the same healthy state at the demand-inspect threshold did not double the recheck cadence"
+
+  # Round 4: age the timer past the ORIGINAL threshold (240s) but short of the
+  # DOUBLED one (480s) - the relief just earned must hold off this escalation.
+  echo $(( $(date +%s) - 290 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_poll_cycle "$state" "$pid"; then
+    reap "$pid"; fail "a confirmed-healthy pane escalated again before its widened cadence elapsed: $(cat "$out")"
+  fi
+  [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 3 ] \
+    || fail "an escalation fired inside the widened recheck window"
+  reap "$pid"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the widened-cadence absorb round"
+
+  # Past the doubled threshold (480s), the same confirmed-healthy pane escalates
+  # again - the relief bounds the quiet stretch, it does not silence it forever.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "the widened cadence never escalated a confirmed-healthy pane at all: $(cat "$out")"
+  grep -F "escalation 4" "$out" >/dev/null || fail "the widened-cadence escalation did not report escalation count 4: $(cat "$out")"
+  grep -F "cadence relief x4" "$out" >/dev/null || fail "the widened-cadence escalation did not report its next relief multiplier: $(cat "$out")"
+  [ "$(cat "$state/.wedge-backoff-$key" 2>/dev/null || echo 1)" = 4 ] \
+    || fail "a second confirmed-healthy escalation did not double the cadence again"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the widened-cadence escalation"
+  unset FM_FAKE_CREW_STATE
+  pass "several consecutive escalations against an unchanged healthy state widen the recheck cadence instead of repeating it"
+}
+
+test_wedge_escalation_backoff_resets_on_confirmed_state_advancement() {
+  local dir state fakebin out capture_file window key pane_hash sig pid n
+  dir=$(make_case wedge-backoff-reset); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-wedged-backoff-reset"
+  printf 'idle building output' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/wedged-backoff-reset.meta"
+  printf 'working: still monitoring ci\n' > "$state/wedged-backoff-reset.status"
+  sig=$(seen_sig "$state/wedged-backoff-reset.status"); printf '%s' "$sig" > "$state/.seen-wedged-backoff-reset_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle building output")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_poll_cycle "$state" "$pid"; then
+    reap "$pid"; fail "watcher exited on the priming round (should absorb): $(cat "$out")"
+  fi
+  reap "$pid"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional wedge priming stop"
+
+  # Rounds 1-3 with an unchanged read earn the cadence doubling, exactly as the
+  # widening test above.
+  n=1
+  while [ "$n" -le 3 ]; do
+    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    : > "$out"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 100 || fail "watcher did not escalate on consecutive wedge round $n: $(cat "$out")"
+    ack_stopped_cycle "$state" || fail "could not acknowledge wedge escalation round $n"
+    n=$((n + 1))
+  done
+  [ "$(cat "$state/.wedge-backoff-$key" 2>/dev/null || echo 1)" = 2 ] \
+    || fail "priming rounds did not earn the expected cadence doubling"
+
+  # Round 4: the run-step genuinely ADVANCED (a different authoritative read) by
+  # the time the doubled threshold elapses - real advancement, not a static pane.
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (fixing)'
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "watcher did not escalate round 4 on the already-earned cadence: $(cat "$out")"
+  grep -F "cadence relief" "$out" >/dev/null && fail "an advancing read still reported cadence relief: $(cat "$out")"
+  [ "$(cat "$state/.wedge-backoff-$key" 2>/dev/null || echo 1)" = 1 ] \
+    || fail "a changed authoritative read did not reset the recheck cadence to the tight default"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the advancing round 4 escalation"
+
+  # Round 5: cadence is back to the tight default (240s), so it must escalate
+  # well short of the 480s the still-doubled cadence would have required.
+  echo $(( $(date +%s) - 260 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "the reset cadence did not escalate promptly after real advancement: $(cat "$out")"
+  grep -F "escalation 5" "$out" >/dev/null || fail "round 5 did not report escalation count 5: $(cat "$out")"
+  ack_stopped_cycle "$state" || fail "could not acknowledge round 5"
+  unset FM_FAKE_CREW_STATE
+  pass "a changed authoritative read resets the recheck cadence to the tight default instead of inheriting earned relief"
+}
+
+test_wedge_escalation_backoff_caps_at_max_multiplier() {
+  local dir state fakebin out capture_file window key pane_hash sig pid detail
+  dir=$(make_case wedge-backoff-cap); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-wedged-backoff-cap"
+  printf 'idle building output' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/wedged-backoff-cap.meta"
+  printf 'working: still monitoring ci\n' > "$state/wedged-backoff-cap.status"
+  sig=$(seen_sig "$state/wedged-backoff-cap.status"); printf '%s' "$sig" > "$state/.seen-wedged-backoff-cap_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle building output")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  detail='state: working · source: run-step · validating (running)'
+  export FM_FAKE_CREW_STATE=$detail
+
+  # Seed a pane already at the demand-inspect threshold with the cadence relief
+  # already at its cap (the default FM_WEDGE_BACKOFF_MAX_MULTIPLIER=8), and a
+  # last-confirmed read identical to the fake crew state below, so this single
+  # poll exercises the at-cap doubling decision directly instead of looping
+  # through every prior round.
+  printf '7\n' > "$state/.wedge-escalations-$key"
+  printf '8' > "$state/.wedge-backoff-$key"
+  printf '%s' "$detail" > "$state/.wedge-detail-$key"
+  echo $(( $(date +%s) - (240 * 8 + 60) )) > "$state/.stale-since-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "an at-cap confirmed-healthy pane did not escalate past its already-earned threshold: $(cat "$out")"
+  grep -F "escalation 8" "$out" >/dev/null || fail "the at-cap escalation did not report escalation count 8: $(cat "$out")"
+  grep -F "cadence relief x8" "$out" >/dev/null || fail "the at-cap escalation did not stay at the capped multiplier: $(cat "$out")"
+  [ "$(cat "$state/.wedge-backoff-$key" 2>/dev/null || echo 1)" = 8 ] \
+    || fail "the recheck cadence multiplier grew past FM_WEDGE_BACKOFF_MAX_MULTIPLIER"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the at-cap escalation"
+  unset FM_FAKE_CREW_STATE
+  pass "the recheck cadence relief caps at FM_WEDGE_BACKOFF_MAX_MULTIPLIER instead of doubling without bound"
+}
+
 # --- busy pane duration bound: a completed-turn age gate on top of busy -----
 # 2026-07 hibit-agent-focus-nonsteal-r1 incident: a busy pane (herdr "working"
 # and/or the harness's rendered busy footer) is unconditional, unbounded proof
@@ -4082,6 +4283,9 @@ test_stale_terminal_status_overridden_by_active_run
 test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
+test_wedge_escalation_backoff_widens_recheck_cadence_on_confirmed_unchanged_state
+test_wedge_escalation_backoff_resets_on_confirmed_state_advancement
+test_wedge_escalation_backoff_caps_at_max_multiplier
 test_busy_pane_below_turn_age_bound_is_absorbed
 test_busy_pane_stable_hash_escalates_past_turn_age_bound
 test_busy_pane_changing_hash_escalates_past_turn_age_bound
