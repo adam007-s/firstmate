@@ -1662,6 +1662,20 @@ crew_is_paused() {  # <id>
   [ "$(crew_absorb_class "$1")" = paused ]
 }
 
+# The full raw bin/fm-crew-state.sh line for <id> (state, source, and detail),
+# for a caller that needs to tell whether the authoritative state has genuinely
+# CHANGED between two reads rather than just classify it into
+# working/paused/none. wedge_timer_check (bin/fm-watch.sh) is the one caller: a
+# repeated escalation against an UNCHANGED line is stronger "still fine"
+# evidence than an unchanged pane alone, and earns a longer recheck cadence; a
+# changed line (a different run-step, or the same step with new detail) resets
+# it. Same cost profile as crew_absorb_class - not a pure read.
+crew_state_line() {  # <id>
+  local id=$1
+  [ -n "$id" ] || { printf ''; return; }
+  "$FM_CREW_STATE_BIN" "$id" 2>/dev/null || true
+}
+
 # Directories excluded from the worktree write probe below, and the depth it walks.
 # The excluded set is everything a supervisor read or a package manager can write
 # without the crew doing any work - .git first, so firstmate's own read-only git

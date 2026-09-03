@@ -34,7 +34,16 @@
 #                          also carries a "demand-deep-inspection" marker so the
 #                          wake payload itself, not just repetition, forces a
 #                          closer look instead of another routine supervision
-#                          resume. Unless afk is active. A pane whose own task
+#                          resume. Past that same threshold, an escalation whose
+#                          fresh run-step/pane/log read is IDENTICAL to the prior
+#                          escalation's read doubles the recheck cadence (capped
+#                          at FM_WEDGE_BACKOFF_MAX_MULTIPLIER x STALE_ESCALATE_SECS)
+#                          instead of repeating every STALE_ESCALATE_SECS forever,
+#                          so a confirmed-healthy pane costs fewer supervision
+#                          turns the longer it stays confirmed; any DIFFERENT read
+#                          resets the cadence, since that is evidence of real
+#                          advancement rather than a static pane. Unless afk is
+#                          active. A pane whose own task
 #                          worktree was written during the quiet window is
 #                          deferred rather than escalated (wedge_defer_writing),
 #                          because files appearing there are liveness the pane and
@@ -312,8 +321,9 @@ window_label() {
 # The ONE derivation of a window's per-window marker key: `:`, `/` and `.` become
 # `_` so a window name is usable as a filename suffix. Every per-window file the
 # watcher keeps is named by it (.hash-, .count-, .stale-, .stale-since-,
-# .wedge-escalations-, .paused-*, .writing-*), and live homes hold those markers on
-# disk under the current format, so the format lives here alone: a second copy is
+# .wedge-escalations-, .wedge-backoff-, .wedge-detail-, .paused-*, .writing-*),
+# and live homes hold those markers on disk under the current format, so the
+# format lives here alone: a second copy is
 # how a future change to it silently orphans a window's markers instead of clearing
 # them. The helpers below take the derived key rather than re-deriving it, so one
 # poll of one window derives it once.
@@ -577,7 +587,8 @@ signal_turnend_panes_churned() {  # <file> ...
     return 1
   done
   for key in "${churned_keys[@]}"; do
-    if ! rm -f "$STATE/.stale-$key" "$STATE/.wedge-escalations-$key"; then
+    if ! rm -f "$STATE/.stale-$key" "$STATE/.wedge-escalations-$key" \
+      "$STATE/.wedge-backoff-$key" "$STATE/.wedge-detail-$key"; then
       for created in "${created_keys[@]}"; do
         rm -f "$STATE/.churn-since-$created"
       done
@@ -692,6 +703,17 @@ EOF
 # below).
 FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 
+# Past FM_WEDGE_DEMAND_INSPECT_COUNT, a confirmed-healthy escalation costs firstmate
+# a full supervision turn for zero new information: the run step (or pane/log
+# state) wedge_timer_check reads at escalation time is IDENTICAL to what the prior
+# escalation already read. Each such repeat confirmation doubles the recheck
+# cadence (.wedge-backoff-<key>, read by wedge_timer_check), capped at this many
+# times STALE_ESCALATE_SECS so a genuine wedge that starts after a long healthy
+# stretch is still caught in bounded time. A DIFFERENT read (the run advanced, or
+# a fresh pane/log detail) resets the cadence to STALE_ESCALATE_SECS, because state
+# advancement is proof of real work, not just a static pane.
+FM_WEDGE_BACKOFF_MAX_MULTIPLIER=${FM_WEDGE_BACKOFF_MAX_MULTIPLIER:-8}
+
 # One bounded re-surface for a pane the watcher is deliberately absorbing, so no
 # absorb can rot invisibly. <age> is how long the current absorb has held and
 # <throttle> is the per-window marker whose mtime records the last re-surface, so
@@ -743,44 +765,88 @@ clear_write_tracking() {  # <window-key>
   rm -f "$STATE/.writing-since-$key" "$STATE/.writing-resurfaced-$key"
 }
 
+# Drop a window's earned recheck-cadence backoff and last-confirmed state
+# fingerprint wherever its escalation count resets, so a later, unrelated wedge
+# streak always starts at the tight STALE_ESCALATE_SECS cadence rather than
+# inheriting relief a past, already-resolved streak earned.
+clear_wedge_backoff() {  # <window-key>
+  local key=$1
+  rm -f "$STATE/.wedge-backoff-$key" "$STATE/.wedge-detail-$key"
+}
+
 # Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
 # absorbed as provably-working - repairs a missing/corrupt timer (self-heals a
 # watcher restart between recording the hash and recording the timer), or
-# escalates once STALE_ESCALATE_SECS have elapsed. Never re-reads the crew
-# state (the costly check already ran once, at classification time). Shared by
-# both places a hash can be absorbed this way: the plain non-terminal path,
+# escalates once the current (possibly backed-off) recheck threshold has
+# elapsed. Never re-reads the crew state to decide WHETHER to escalate (the
+# costly check already ran once, at classification time) - only to decide the
+# NEXT recheck cadence, and only once we are already about to escalate. Shared
+# by both places a hash can be absorbed this way: the plain non-terminal path,
 # and the stale_is_terminal-overridden path (a captain-relevant status-log
 # line that an active run/busy pane outranked).
-# The worktree write probe runs ONLY here, inside the at-threshold branch that is
-# about to escalate: at most one bounded walk per window per STALE_ESCALATE_SECS,
-# never per poll.
+# The worktree write probe and the state-advancement read both run ONLY here,
+# inside the at-threshold branch that is about to escalate: at most one bounded
+# walk and one crew-state read per window per recheck window, never per poll.
+#
+# Backoff rationale (the fm-stale-during-validation fix): past
+# FM_WEDGE_DEMAND_INSPECT_COUNT, an escalation whose fresh crew_state_line read
+# is IDENTICAL to the one the PRIOR escalation recorded is confirmation of the
+# exact same healthy state, not new information - repeating it every
+# STALE_ESCALATE_SECS costs a full supervision turn each time for nothing. Each
+# such repeat confirmation doubles the recheck cadence via .wedge-backoff-<key>,
+# capped at FM_WEDGE_BACKOFF_MAX_MULTIPLIER so a real wedge that starts after a
+# long healthy stretch is still caught in bounded time. A DIFFERENT read (a new
+# run-step, or the same step with new detail - e.g. a growing log tail) is
+# proof of real advancement and resets the cadence to the tight default,
+# because the whole point of the relief is "still confirming the SAME thing",
+# never "stopped looking closely".
 wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> <task>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 task=$5 since age n reason
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 task=$5
+  local key since age n reason backoff threshold detail_file backoff_file detail prev_detail new_backoff
+  key=$(window_key "$win")
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
       # Publish the repaired timer only after its old write-deferral chain is
       # gone, so observers cannot mistake a new idle window for the old chain.
-      clear_write_tracking "$(window_key "$win")"
+      clear_write_tracking "$key"
       date +%s > "$since_file"
       triage_log "absorbed $label timer reset: $win"
       ;;
     *)
+      backoff_file="$STATE/.wedge-backoff-$key"
+      backoff=$(cat "$backoff_file" 2>/dev/null || true)
+      case "$backoff" in ''|*[!0-9]*|0) backoff=1 ;; esac
+      threshold=$(( STALE_ESCALATE_SECS * backoff ))
       age=$(( $(date +%s) - since ))
-      if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
+      if [ "$age" -ge "$threshold" ]; then
         if crew_worktree_written_since "$task" "$STATE" "$since_file"; then
           wedge_defer_writing "$win" "$since_file" "$label" "$age"
           return 0
         fi
         n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
         echo "$n" > "$escalation_file"
+        detail_file="$STATE/.wedge-detail-$key"
+        detail=$(crew_state_line "$task")
+        prev_detail=$(cat "$detail_file" 2>/dev/null || true)
+        if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ] && [ -n "$detail" ] && [ "$detail" = "$prev_detail" ]; then
+          new_backoff=$(( backoff * 2 ))
+          [ "$new_backoff" -le "$FM_WEDGE_BACKOFF_MAX_MULTIPLIER" ] || new_backoff=$FM_WEDGE_BACKOFF_MAX_MULTIPLIER
+        else
+          new_backoff=1
+        fi
+        printf '%s' "$new_backoff" > "$backoff_file"
+        printf '%s' "$detail" > "$detail_file"
         reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
         if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
           reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
+          if [ "$new_backoff" -gt 1 ]; then
+            reason="$reason, next recheck in $(( STALE_ESCALATE_SECS * new_backoff ))s (confirmed unchanged, cadence relief x$new_backoff)"
+          fi
         fi
         fm_wake_append stale "$win" "$reason" || exit 1
         rm -f "$since_file"
-        clear_write_tracking "$(window_key "$win")"
+        clear_write_tracking "$key"
         wake "$reason"
       fi
       ;;
@@ -823,6 +889,7 @@ handle_paused_stale() {  # <window> <task> <hash>
   : > "$STATE/.paused-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
   clear_write_tracking "$key"
+  clear_wedge_backoff "$key"
   statusf="$STATE/$task.status"
   mtime=$(stat_mtime "$statusf")
   case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
@@ -880,6 +947,7 @@ busy_turn_bound_check() {  # <window> <task> <hash> <since-file> <escalation-fil
       key=$(window_key "$win")
       rm -f "$since_file" "$escalation_file"
       clear_write_tracking "$key"
+      clear_wedge_backoff "$key"
       declared="declared:$(fm_wake_signal_sig "$statusf" || true)"
       if [ "$(cat "$STATE/.stale-$key" 2>/dev/null || true)" != "$declared" ]; then
         fm_wake_append stale "$win" "stale: $win" || exit 1
@@ -904,6 +972,7 @@ clear_pause_tracking() {  # <window-key>
   local key=$1
   clear_pause_state "$key"
   clear_write_tracking "$key"
+  clear_wedge_backoff "$key"
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
 
@@ -1884,6 +1953,7 @@ EOF
         else
           rm -f "$ssf" "$ewf"
           clear_write_tracking "$key"
+          clear_wedge_backoff "$key"
         fi
         # A busy pane normally means real work resumed, so stale pause bookkeeping
         # is cleared - but not in the same poll the declared-pause cadence just
@@ -1902,6 +1972,7 @@ EOF
       else
         rm -f "$ssf" "$ewf"
         clear_write_tracking "$key"
+        clear_wedge_backoff "$key"
       fi
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" && [ "$busy_now" -ne 0 ]; then
